@@ -1,75 +1,169 @@
 #!/usr/bin/python3
-# horrible python script to set time and date  on the IC7300
-# or other Icom radios that use the same protocol.
-# I made this script because the IC7300 has a faulty RTC battery and it does not have
-# ethernet connection and NTP client like the 7610, 705, 9700, R8600, etc.
-# This script sets the time slightly wrong because you cannot set seconds, only minutes.
+#
+# Original script by IZ4UFQ
+# Modifications for auto-detection and precision sync by M0SPN/OH3SPN
+#
+# Script to set time and date on the IC-7300 or other Icom radios via CI-V.
+#
 
-# I'm a sysadmin and not a programmer and this script violates ALL the programming
-# best practices. ALL of them. Feel free to make it much better.
-# IZ4UFQ
-
-
-civaddress="0x94" #this is the default IC7300 address. Change to match your radio config.
-baudrate = 19200  #change to match your radio serial speed
-serialport = "/dev/ttyUSB0"  # Serial port of your radios serial interface. See comment below
-
-# you can set a serial port by id so that it always connect to the correct radio, usefeul if you have more than
-# one usb serial port connected (I have 8 of them)
-#serialport = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_IC-7300_03005669-if00-port0"
-
-
-#Import libraries we'll need to use
 import time
 import serial
+import serial.tools.list_ports
 import struct
+import datetime
+import sys
+import argparse
 
-# Get time in GMT. If you want local time change to "t = time.localtime()"
-t = time.gmtime()
+# --- CONFIGURATION ---
+CIV_ADDRESS = 0x94       # 0x94 is default for IC-7300
+BAUDRATE = 19200         # Match your radio settings
+# ---------------------
 
+def bcd(value):
+    """Converts an integer to BCD (Binary Coded Decimal)."""
+    return int(f"{value:02d}", 16)
 
-# extract strings for year, day, month, hour, minute 
-# with a leading zero if needed
-year = str(t.tm_year)
-month = str(t.tm_mon).rjust(2,'0')
-day = str(t.tm_mday).rjust(2,'0')
-hour = str(t.tm_hour).rjust(2,'0')
-minute = str(t.tm_min).rjust(2,'0')
+def send_command(ser, address, command_body):
+    """Sends a CI-V command."""
+    cmd = [0xFE, 0xFE, address, 0xE0] + command_body + [0xFD]
+    ser.write(bytearray(cmd))
+    ser.flush()
 
+def is_radio_on(ser, address):
+    """
+    Checks if radio is responsive by requesting its ID (Cmd 19 00).
+    Returns True if radio replies, False otherwise.
+    """
+    # Clear any stale input buffer
+    ser.reset_input_buffer()
+    
+    # Send 'Read ID' command: 19 00
+    # Expected reply: FE FE E0 [Address] 19 00 [ID] FD
+    send_command(ser, address, [0x19, 0x00])
+    
+    # Wait briefly for a reply
+    time.sleep(0.2)
+    
+    if ser.in_waiting > 0:
+        # We received data back, so the radio is ON and listening
+        # We don't strictly need to parse the ID, just knowing it replied is enough
+        ser.reset_input_buffer()
+        return True
+    
+    return False
 
-# set date, ci-v command is 0x94
-command = ["0xFE", "0xFE", civaddress, "0xE0", "0x1A", "0x05", "0x00" ]
-command.append("0x94")
-command.append("0x"+year[0:2])
-command.append("0x"+year[2:])
-command.append("0x"+month)
-command.append("0x"+day)
-command.append("0xFD")
+def find_radio_port(baudrate, address):
+    """
+    Finds the correct serial port by searching for Silicon Labs CP210x devices 
+    and pinging them with a CI-V 'Read ID' command.
+    """
+    ports = serial.tools.list_ports.comports()
+    
+    # Filter by common identifiers for the IC-7300's internal USB bridge (10c4:ea60)
+    potential_ports = []
+    for p in ports:
+        if "CP210" in p.description or (p.vid == 0x10c4 and p.pid == 0xea60):
+            potential_ports.append(p.device)
+    
+    if not potential_ports:
+        # Fallback: Check for any ttyUSB device if no CP210x is explicitly matched
+        potential_ports = [p.device for p in ports if "ttyUSB" in p.device]
 
-ser = serial.Serial(serialport, baudrate)
-count = 0
-while(count < 13):
-    senddata = int(bytes(command[count], 'UTF-8'), 16)
-    ser.write(struct.pack('>B', senddata))
-    count = count +1
-ser.close()
+    if not potential_ports:
+        return None
 
-# set time, ci-v command is 0x95
-# you CANNOT set seconds, so unless you want to wait for the minute mark
-# you'll end up with a time that is set incorrectly by less than one minute
-# I prefer to set time incorrectly than to wait for up to 59 seconds 
+    print(f"Scanning {len(potential_ports)} potential port(s)...")
 
-command = ["0xFE", "0xFE", civaddress, "0xE0", "0x1A", "0x05", "0x00" ]
-command.append("0x95")
-command.append("0x"+hour)
-command.append("0x"+minute)
-command.append("0xFD")
+    for port_name in potential_ports:
+        try:
+            # Short timeout for discovery
+            with serial.Serial(port_name, baudrate, timeout=0.5) as ser:
+                if is_radio_on(ser, address):
+                    return port_name
+        except (serial.SerialException, OSError):
+            continue
+            
+    return None
 
-ser = serial.Serial(serialport, baudrate)
-count = 0
-while(count < 11):
-    senddata = int(bytes(command[count], 'UTF-8'), 16)
-    ser.write(struct.pack('>B', senddata))
-    count = count +1
-ser.close()
+def main():
+    parser = argparse.ArgumentParser(description="Sync IC-7300 time via CI-V.")
+    parser.add_argument("--now", action="store_true", help="Set time immediately (resets seconds to 00), skipping the wait for the top of the minute.")
+    parser.add_argument("--port", help="Force a specific serial port (e.g. /dev/ttyUSB0). If omitted, the script will auto-detect.")
+    args = parser.parse_args()
 
+    target_port = args.port
+    
+    if not target_port:
+        print("Auto-detecting radio port...")
+        target_port = find_radio_port(BAUDRATE, CIV_ADDRESS)
+        
+    if not target_port:
+        print("Error: Could not find IC-7300. Check connection and power.")
+        sys.exit(1)
+
+    print(f"Using {target_port}...")
+    
+    try:
+        with serial.Serial(target_port, BAUDRATE, timeout=1) as ser:
+            
+            # 1. DOUBLE-CHECK RADIO STATUS (if port was specified manually)
+            if args.port:
+                print("Checking radio status...")
+                if not is_radio_on(ser, CIV_ADDRESS):
+                    print(f"Error: Radio is not responding on {target_port}.")
+                    sys.exit(1)
+            
+            print("Radio ready!")
+
+            # 2. SET DATE
+            now = datetime.datetime.now(datetime.timezone.utc)
+            year_str = f"{now.year:04d}"
+            
+            # Cmd 1A 05 00 94: Set Date (Year, Month, Day)
+            body_date = [
+                0x1A, 0x05, 0x00, 0x94,
+                int(year_str[0:2], 16),
+                int(year_str[2:4], 16),
+                bcd(now.month),
+                bcd(now.day)
+            ]
+            send_command(ser, CIV_ADDRESS, body_date)
+            print(f"Date set to {now.strftime('%Y-%m-%d')}.")
+
+            # 3. SET TIME
+            if args.now:
+                # Immediate Update
+                target_time = now
+                print(f"Force update requested (--now). Setting time to {target_time.strftime('%H:%M')} immediately.")
+            else:
+                # Wait for next minute
+                target_time = now + datetime.timedelta(minutes=1)
+                target_time = target_time.replace(second=0, microsecond=0)
+                
+                wait_seconds = (target_time - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                
+                print(f"Current Time: {now.strftime('%H:%M:%S')}")
+                print(f"Waiting {wait_seconds:.2f} seconds to sync at {target_time.strftime('%H:%M:00')}...")
+                
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+
+            # Cmd 1A 05 00 95: Set Time (Hour, Minute)
+            body_time = [
+                0x1A, 0x05, 0x00, 0x95,
+                bcd(target_time.hour),
+                bcd(target_time.minute)
+            ]
+            send_command(ser, CIV_ADDRESS, body_time)
+            print(f"Time {target_time.strftime('%H:%M')} sent successfully.")
+
+    except serial.SerialException as e:
+        print(f"\nError: Could not open serial port {target_port}.")
+        print("Is the USB cable plugged in or in use by another program?")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nAn unexpected error occurred: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
